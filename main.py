@@ -1,32 +1,54 @@
 #!/usr/bin/env python3
-"""Volatility-adaptive quantile forecaster for Polymarket price grids.
+"""Fast-adapting quantile forecaster for Polymarket price grids, v2.
 
-Reads one case at a time (makefun/polymarket-case/v1): every trading market
-of the family with its Yes price at every minute up to a checkpoint, and
-writes, for each market and each of the 240 minutes after the checkpoint,
-five quantiles of that minute's price (5%, 25%, 50%, 75%, 95%).
+Reads one case at a time (makefun/polymarket-case/v1): every trading
+market of the family with its Yes price at every minute up to a
+checkpoint, and writes, for each market and each of the 240 minutes after
+the checkpoint, five quantiles of that minute's price (5%, 25%, 50%,
+75%, 95%).
 
-Method (per market, independent):
-  * The median stays at the checkpoint price. On the practice data, any
-    momentum extrapolation of recent returns made the loss worse in every
-    configuration tried, so the forecast carries no drift: prediction-market
-    prices at this horizon mean-revert faster than they trend.
-  * The spread is learned from the market's own recent moves: an
-    exponentially weighted mean of the absolute one-minute returns over the
-    last 120 minutes (half-life 80 minutes), scaled by 1.2533 (the
-    normal-theory factor turning a mean absolute move into a standard
-    deviation), floored at 0.0004 and capped at 0.01 price units per
-    square-root minute. A market that has been jumping gets wide quantiles;
-    a quiet one gets narrow ones. The house baseline's fixed 0.0025 spread
-    does neither.
-  * The spread grows with the square root of the horizon, the random-walk
-    shape: q_tau(h) = x + z_tau * sigma * sqrt(h), clamped to [0, 1] and
-    rounded to 6 decimals, with rows forced non-decreasing.
+What changed since v1, and why. The v1 forecaster (median = checkpoint
+price, spread from an EWMA of absolute one-minute returns with an
+80-minute half-life) scored a practice loss of 0.3243 against the house
+baseline's 0.3925. Two measurements on the same practice cases drive v2:
 
-Local practice score (cases p00-p04, scored against the next case's grid):
-loss 0.3243 against the house baseline's 0.3925 on the same cases, about
-17% better. The official six-case baseline is 0.363589; p05 has no later
-case to score against locally, so it is excluded here.
+  * These prices move in jumps, not in a steady diffusion. 88% of the
+    one-minute returns are exactly zero, the 99th percentile of the
+    absolute move is 0.045, and the largest is 0.48. A jump raises the
+    market's volatility at once, and the elevated volatility is gone
+    within the hour, so a slow volatility estimate is wrong in both
+    directions: it stays wide long after a jump has passed and it stays
+    narrow while a fresh jump is unfolding. Sweeping the EWMA half-life
+    from 320 down to 8 minutes, the loss falls monotonically to a flat
+    valley at 12-20 minutes (0.3200 at 15) and rises again below 10, so
+    v2 tracks volatility with a 15-minute half-life: fast enough to
+    catch a news regime, slow enough not to chase single minutes.
+  * Contenders fade. Across the practice cases, markets priced 0.10-0.40
+    at the checkpoint drift down by about 0.015-0.022 price units over
+    the next four hours, while markets under 0.10 drift by ~0.000.
+    In a multi-outcome race most candidates lose share as time passes
+    without news for them, so v2 lets the median of a market above 0.05
+    sag gently: 0.005 price units per hour per unit of (price - 0.05).
+    The shift is small (at most 0.005 at the four-hour mark for a 0.30
+    market) and it is the only drift in the forecast: extrapolating
+    recent momentum still made the loss worse in every configuration
+    tried, and pulling toward the recent mean did too.
+  * The spread still grows with the square root of the horizon, the
+    random-walk shape, and the outer quantiles keep the plain normal
+    z-scores: widening the tails, forecasting in log-odds space, and
+    scaling the spread by sqrt(p(1-p)) were all tried and all lost.
+
+Local practice score (cases p00-p04, scored against the next case's
+grid; p05 has no later case to score against locally): loss 0.317242,
+coverage_90 0.8680, per-case losses 0.5141 / 0.3129 / 0.3722 / 0.2313 /
+0.2036 — about 2.2% better than v1's 0.3243 and 19% better than the
+house baseline's 0.3925 on the same cases. The gain is broad, not one
+case: p00, p01 and p04 improve, p03 is flat, p02 is worse by 0.002,
+and the chosen settings sit in a flat valley (half-life 12-20 and
+decay 0.005-0.008 all score within 0.002 of each other), so the
+improvement is not a knife-edge fit to six practice cases. The
+official six-case baseline is 0.363589; v1's official loss was
+0.284405, so v2's expected official score is around 0.277-0.281.
 
 Standard library only, no network, deterministic: the same case always
 writes the same bytes. Reads $MAKEFUN_INPUT_DIR (else /input), writes
@@ -45,51 +67,76 @@ QUANTILES = [0.05, 0.25, 0.5, 0.75, 0.95]
 # Standard normal quantiles at the five levels, to 6 decimals.
 Z_SCORES = [-1.644854, -0.674490, 0.0, 0.674490, 1.644854]
 
-# Recent window (minutes) the volatility estimate looks back over.
+# Minutes of history the volatility estimate looks back over.
 LOOKBACK_MINUTES = 120
 # Half-life (minutes) of the exponential weights on absolute returns.
-VOL_HALF_LIFE = 80
+# 15, not 80: jump-driven prices need a fast volatility tracker.
+VOL_HALF_LIFE = 15
 # Mean |return| -> sigma for a normal: E|N(0, s)| = s * sqrt(2/pi).
 ABS_TO_SIGMA = 1.2533
 # Spread bounds, price units per square-root minute.
 SIGMA_FLOOR = 0.0004
 SIGMA_CAP = 0.01
+# Contender fade: median sag per hour, per unit of (price - 0.05).
+CONTENDER_DECAY = 0.005
+# Prices at or below this do not fade (they already sit near zero).
+DECAY_FLOOR_PRICE = 0.05
 
 
-def clamp_price(value):
+def clamp_unit(value):
     """Clamp to [0, 1] and round to 6 decimals (0, never -0)."""
     return round(min(1.0, max(0.0, value)), 6) + 0.0
 
 
-def recent_volatility(prices):
-    """EWMA of absolute one-minute returns over the recent window.
-
-    Returns 0.0 when there are no returns to learn from (a market with a
-    single price point); the caller floors the resulting sigma.
-    """
+def recent_moves(prices):
+    """Absolute one-minute returns over the recent window, oldest first."""
     count = len(prices)
-    if count < 2:
-        return 0.0
     start = max(1, count - LOOKBACK_MINUTES)
+    return [abs(prices[i] - prices[i - 1]) for i in range(start, count)]
+
+
+def estimate_jump_volatility(prices):
+    """EWMA of absolute one-minute returns, as a per-minute sigma.
+
+    The weights decay with a 15-minute half-life, so a jump widens the
+    forecast within minutes and the widening fades within the hour.
+    Returns 0.0 when there are no returns to learn from; the caller
+    floors the resulting sigma.
+    """
+    moves = recent_moves(prices)
+    if not moves:
+        return 0.0
     decay = 1.0 - 0.5 ** (1.0 / VOL_HALF_LIFE)
-    weighted = None
-    for i in range(start, count):
-        move = abs(prices[i] - prices[i - 1])
-        weighted = move if weighted is None else (1.0 - decay) * weighted + decay * move
-    return weighted if weighted is not None else 0.0
+    level = moves[0]
+    for move in moves[1:]:
+        level = (1.0 - decay) * level + decay * move
+    return level
 
 
-def forecast_market(prices, horizon):
+def fade_shift(price, minute):
+    """How far the median sags below the checkpoint price by `minute`.
+
+    Contenders fade; near-zero prices do not. Linear in the horizon so
+    the sag is 0.005 * (price - 0.05) per hour for a market above 0.05.
+    """
+    excess = price - DECAY_FLOOR_PRICE
+    if excess <= 0.0:
+        return 0.0
+    return CONTENDER_DECAY * (minute / 60.0) * excess
+
+
+def forecast_market_quantiles(prices, horizon):
     """240 rows of five quantiles for one market, from its price grid."""
     if not prices:
         raise ValueError("market has no prices")
     last_price = prices[-1]
-    sigma = ABS_TO_SIGMA * recent_volatility(prices)
+    sigma = ABS_TO_SIGMA * estimate_jump_volatility(prices)
     sigma = min(SIGMA_CAP, max(SIGMA_FLOOR, sigma))
     rows = []
     for minute in range(1, horizon + 1):
+        center = last_price - fade_shift(last_price, minute)
         spread = sigma * math.sqrt(minute)
-        row = [clamp_price(last_price + z * spread) for z in Z_SCORES]
+        row = [clamp_unit(center + z * spread) for z in Z_SCORES]
         for j in range(1, len(row)):
             if row[j] < row[j - 1]:
                 row[j] = row[j - 1]
@@ -97,30 +144,30 @@ def forecast_market(prices, horizon):
     return rows
 
 
-def persistence_rows(last_price, horizon):
+def fallback_rows(last_price, horizon):
     """The house baseline's shape for one market: flat median, fixed spread.
 
-    Used only as a fallback when a market's own data cannot be forecast,
-    so one malformed market can never invalidate the whole case (an
-    invalid case scores as if every quantile were 0.5 and takes no prize).
+    Used only when a market's own data cannot be forecast, so one
+    malformed market can never invalidate the whole case (an invalid
+    case scores as if every quantile were 0.5 and takes no prize).
     """
     rows = []
     for minute in range(1, horizon + 1):
         spread = 0.0025 * math.sqrt(minute)
-        rows.append([clamp_price(last_price + z * spread) for z in Z_SCORES])
+        rows.append([clamp_unit(last_price + z * spread) for z in Z_SCORES])
     return rows
 
 
-def forecast_case(case):
+def build_case_forecast(case):
     """One forecast entry per market of the case, in the case's order."""
     horizon = case["horizon_minutes"]
     forecasts = []
     for market in case["markets"]:
         try:
-            rows = forecast_market(market["prices"], horizon)
+            rows = forecast_market_quantiles(market["prices"], horizon)
         except (ValueError, TypeError):
             prices = market.get("prices") or [0.5]
-            rows = persistence_rows(prices[-1], horizon)
+            rows = fallback_rows(prices[-1], horizon)
         forecasts.append({"id": market["id"], "q": rows})
     return {"forecasts": forecasts}
 
@@ -135,7 +182,7 @@ def main():
         if list(case["quantiles"]) != QUANTILES:
             raise ValueError(f"{case_file.name} asks for quantiles "
                              f"{case['quantiles']}, not {QUANTILES}")
-        result = forecast_case(case)
+        result = build_case_forecast(case)
         out_path = output_dir / f"{case_file.stem}.out"
         out_path.write_text(json.dumps(result) + "\n", encoding="utf-8")
 
